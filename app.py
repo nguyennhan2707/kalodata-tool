@@ -60,6 +60,11 @@ def clean_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].apply(lambda x: round(parse_vn_num(x), 1))
     return df
 
+def format_price_state(key: str):
+    raw = str(st.session_state.get(key, "")).strip()
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    st.session_state[key] = f"{int(digits):,}".replace(",", ".") if digits else ""
+
 # --- 2. KẾT NỐI GOOGLE SHEETS ---
 @st.cache_resource
 def get_spreadsheet():
@@ -290,7 +295,7 @@ def filter_dataframe(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
                         df = df[df[col].astype(str).str.contains(search_text.strip(), case=False, na=False)]
     return df
 
-# --- CẤU HÌNH HIỂN THỊ CỘT (PHÂN CÁCH HÀNG NGHÌN, KHÔNG SỐ LẺ) ---
+# --- CẤU HÌNH HIỂN THỊ CỘT ---
 COLUMN_CONFIG = {
     "Ảnh SP": st.column_config.ImageColumn("Ảnh SP"),
     "Đơn giá (VNĐ)": st.column_config.NumberColumn("Đơn giá (VNĐ)", format="localized", step=1),
@@ -320,7 +325,6 @@ def render_dashboard_section(key_prefix: str, region_code: str, lang_code: str, 
         sel_batch = st.selectbox("📅 Chọn đợt chạy:", batches, key=f"{key_prefix}_batch")
         df_b = df_dash[df_dash["Đợt chạy"].astype(str) == sel_batch].copy()
 
-        # Thanh lọc nhanh trên Dashboard
         f1, f2, f3 = st.columns(3)
         max_nst_val = int(df_b["Số NST"].max() or 100)
         nst_upper = max(max_nst_val, 100)
@@ -341,7 +345,6 @@ def render_dashboard_section(key_prefix: str, region_code: str, lang_code: str, 
 
         df_b["Xu hướng doanh thu"] = df_b["Xu hướng doanh thu"].apply(parse_trend_list)
 
-        # --- BIỂU ĐỒ CỘT TỪ THẤP ĐẾN CAO (CLICK ĐỂ MỞ POPUP) ---
         if not df_b.empty:
             st.markdown("#### 📊 Biểu đồ xếp hạng sản phẩm tiềm năng (Thấp → Cao)")
             st.caption("💡 Bấm trực tiếp vào bất kỳ cột sản phẩm nào trên biểu đồ để mở **Popup chi tiết đầy đủ**.")
@@ -404,7 +407,6 @@ def render_dashboard_section(key_prefix: str, region_code: str, lang_code: str, 
             else:
                 st.session_state[token_key] = None
 
-        # --- BẢNG DỮ LIỆU & BƯỚC 3 ---
         st.markdown("#### 📋 Bảng danh sách & Bước 3 (Check Ads + Video AI)")
         df_b_tbl = df_b.copy()
         df_b_tbl.insert(0, "Chọn check Ads", False)
@@ -497,6 +499,12 @@ def render_dashboard_section(key_prefix: str, region_code: str, lang_code: str, 
 st.title("Tool Săn Sản Phẩm TikTok Shop")
 df_master = load_master_data()
 
+# Khởi tạo giá trị mặc định cho 2 ô khoảng đơn giá
+if "price_from_str" not in st.session_state:
+    st.session_state["price_from_str"] = "25.000"
+if "price_to_str" not in st.session_state:
+    st.session_state["price_to_str"] = "150.000"
+
 # --- THANH BỘ LỌC API BÊN TRÁI ---
 with st.sidebar:
     st.header("⚙️ Bộ lọc gọi API")
@@ -574,14 +582,73 @@ with st.sidebar:
         "Doanh thu Livestream": "live_revenue",
         "Doanh thu Tủ trưng bày": "showcase_revenue"
     }
-    sort_field_label = st.selectbox("Sắp xếp theo", list(sort_field_options.keys()), index=0)
+    sort_field_desc = {
+        "Doanh thu từ Video": "Xếp hạng các SP bán chạy nhất qua video ngắn — phù hợp nhất cho kênh Affiliate làm Video AI.",
+        "Tỷ lệ tăng trưởng doanh thu": "Tìm các SP đang bùng nổ doanh số nhanh nhất để bắt trend sớm.",
+        "Tổng doanh thu": "Xếp hạng theo tổng doanh thu từ mọi nguồn (Video + Live + Tủ trưng bày).",
+        "Số lượng bán (Lượt bán)": "Xếp hạng theo tổng số đơn hàng bán ra nhiều nhất.",
+        "Tỷ lệ hoa hồng (%)": "Ưu tiên các SP có mức chiết khấu Affiliate cao nhất.",
+        "Đơn giá sản phẩm": "Xếp hạng theo giá bán sản phẩm từ cao đến thấp (hoặc ngược lại).",
+        "Ngày ra mắt": "Tìm các SP mới lên sàn gần đây nhất để đón đầu ít cạnh tranh.",
+        "Doanh thu Livestream": "Xếp hạng các SP bán chạy chủ yếu qua phiên Live.",
+        "Doanh thu Tủ trưng bày": "Xếp hạng các SP có khách tự tìm mua qua giỏ hàng/tủ trưng bày."
+    }
+    sort_field_label = st.selectbox(
+        "Sắp xếp theo",
+        list(sort_field_options.keys()),
+        index=0,
+        help="Tiêu chí xếp hạng bắt buộc để Kalodata trả về Top 100 sản phẩm tương ứng."
+    )
+    st.caption(f"💡 {sort_field_desc[sort_field_label]}")
 
     sort_type_options = {"Giảm dần (Cao → Thấp)": "DESC", "Tăng dần (Thấp → Cao)": "ASC"}
     sort_type_label = st.selectbox("Thứ tự sắp xếp", list(sort_type_options.keys()), index=0)
 
     keyword = st.text_input("Từ khóa tìm kiếm", value="", placeholder="VD: bánh tráng, khô gà...")
     commission = st.text_input("Tỷ lệ hoa hồng (%)", value=">=10", help="VD: >=10, 15-35, <20")
-    price_range = st.text_input("Khoảng đơn giá", value="25000-150000", help="Xóa trống để lấy mọi mức giá")
+
+    # Khoảng đơn giá: tách 2 ô Từ - Đến, tự động chấm hàng nghìn trên UI
+    st.markdown("**Khoảng đơn giá (VNĐ)**")
+    col_p1, col_p2 = st.columns(2)
+    col_p1.text_input(
+        "Từ",
+        key="price_from_str",
+        on_change=format_price_state,
+        args=("price_from_str",),
+        placeholder="VD: 25.000",
+        help="Nhập số rồi bấm Enter, web tự thêm dấu chấm. Xóa trống nếu không giới hạn."
+    )
+    col_p2.text_input(
+        "Đến",
+        key="price_to_str",
+        on_change=format_price_state,
+        args=("price_to_str",),
+        placeholder="VD: 150.000",
+        help="Không được nhỏ hơn giá Từ. Xóa trống nếu không giới hạn."
+    )
+
+    p_from_digits = "".join(ch for ch in st.session_state["price_from_str"] if ch.isdigit())
+    p_to_digits = "".join(ch for ch in st.session_state["price_to_str"] if ch.isdigit())
+    p_from_val = int(p_from_digits) if p_from_digits else None
+    p_to_val = int(p_to_digits) if p_to_digits else None
+
+    price_invalid = False
+    price_range_api = ""
+    price_display = "Tất cả"
+
+    if p_from_val is not None and p_to_val is not None:
+        if p_to_val < p_from_val:
+            price_invalid = True
+            st.error("⚠️ Giá 'Đến' không được nhỏ hơn giá 'Từ'.")
+        else:
+            price_range_api = f"{p_from_val}-{p_to_val}"
+            price_display = f"{st.session_state['price_from_str']}đ – {st.session_state['price_to_str']}đ"
+    elif p_from_val is not None:
+        price_range_api = f">={p_from_val}"
+        price_display = f"Từ {st.session_state['price_from_str']}đ trở lên"
+    elif p_to_val is not None:
+        price_range_api = f"<={p_to_val}"
+        price_display = f"Đến {st.session_state['price_to_str']}đ"
 
     with st.expander("🎯 Bộ lọc nâng cao (Shop, Affiliate, Vận chuyển)"):
         df_shop_all = df_master[df_master["loai_du_lieu"] == "shop"]
@@ -643,7 +710,7 @@ with st.sidebar:
         need_image = st.checkbox("Lấy link ảnh sản phẩm (Miễn phí)", value=True)
         need_extra = st.checkbox("Lấy thêm Tên Shop & Số SKU (Miễn phí)", value=True)
 
-# Xây dựng payload chung cho /product/rank
+# Xây dựng payload chung cho /product/rank (đã bỏ dấu chấm ở khoảng giá)
 api_payload = {
     "region": region_code,
     "language": lang_code,
@@ -671,8 +738,8 @@ if keyword.strip():
     api_payload["keyword"] = keyword.strip()
 if commission.strip():
     api_payload["commission_rate"] = commission.strip()
-if price_range.strip():
-    api_payload["unit_price_range"] = price_range.strip()
+if price_range_api:
+    api_payload["unit_price_range"] = price_range_api
 if affiliate_options[affiliate_label] is not None:
     api_payload["is_affiliate"] = affiliate_options[affiliate_label]
 if delivery_options[delivery_label] is not None:
@@ -714,7 +781,7 @@ with tab_batch:
     st.info(
         f"**Cấu hình bộ lọc bên trái hiện tại:**\n"
         f"- Ngành hàng: **{cat_summary}** | Thời gian: **{date_label}**\n"
-        f"- Hoa hồng: **{commission or 'Tất cả'}** | Khoảng giá: **{price_range or 'Tất cả'}**"
+        f"- Hoa hồng: **{commission or 'Tất cả'}** | Khoảng giá: **{price_display}**"
     )
 
     with st.container(border=True):
@@ -725,13 +792,13 @@ with tab_batch:
         top_n_detail = c_p3.number_input("Số SP lấy chi tiết ở Bước 2", min_value=1, max_value=30, value=20)
 
         max_cost_b12 = 0.1 + top_n_detail * 0.1
-        if st.button(f"🚀 Chạy Bước 1 & 2 (Tối đa {max_cost_b12:.1f} điểm)", type="primary"):
+        if st.button(f"🚀 Chạy Bước 1 & 2 (Tối đa {max_cost_b12:.1f} điểm)", type="primary", disabled=price_invalid):
             st.session_state["confirm_b12"] = True
 
-        if st.session_state.get("confirm_b12"):
+        if st.session_state.get("confirm_b12") and not price_invalid:
             st.warning(
                 f"⚠️ **Xác nhận gọi API Bước 1 & 2:**\n"
-                f"- Ngành hàng: **{cat_summary}** | Thời gian: **{date_label}**\n"
+                f"- Ngành hàng: **{cat_summary}** | Khoảng giá: **{price_display}** | Thời gian: **{date_label}**\n"
                 f"- Chi phí tối đa: **{max_cost_b12:.1f} điểm** (~{int(max_cost_b12 * 3000):,}đ)"
             )
             col_cf1, col_cf2, _ = st.columns([1.2, 1, 4])
@@ -828,12 +895,12 @@ with tab_batch:
 # TAB 3: LẤY NHANH TOP 100 (API ĐƠN)
 # ==========================================
 with tab_quick:
-    if st.button(f"Gọi API lấy Top {page_size} (Trang {page_number}) & Lưu vào Sheet — 0.1 điểm", type="primary"):
+    if st.button(f"Gọi API lấy Top {page_size} (Trang {page_number}) & Lưu vào Sheet — 0.1 điểm", type="primary", disabled=price_invalid):
         st.session_state["confirm_tab2"] = True
 
-    if st.session_state.get("confirm_tab2"):
+    if st.session_state.get("confirm_tab2") and not price_invalid:
         cat_summary_t2 = " > ".join(selected_cat_path) if selected_cat_path else (manual_cat_ids or "Tất cả ngành")
-        st.warning(f"⚠️ **Xác nhận gọi API lấy nhanh Top {page_size}** | Ngành: **{cat_summary_t2}** | Chi phí: **0.1 điểm** (~300đ).")
+        st.warning(f"⚠️ **Xác nhận gọi API lấy nhanh Top {page_size}** | Ngành: **{cat_summary_t2}** | Giá: **{price_display}** | Chi phí: **0.1 điểm** (~300đ).")
         ct2_1, ct2_2, _ = st.columns([1.2, 1, 4])
         if ct2_1.button("✅ Xác nhận gọi", key="exec_tab2", type="primary"):
             st.session_state["confirm_tab2"] = False
