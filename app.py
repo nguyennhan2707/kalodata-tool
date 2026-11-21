@@ -197,7 +197,7 @@ def call_kalodata_api(endpoint: str, payload: dict):
         "Content-Type": "application/json",
         "secret-key": st.secrets["KALODATA_SECRET_KEY"]
     }
-    res = requests.post(url, json=payload, headers=headers, timeout=30)
+    res = requests.post(url, json=payload, headers=headers, timeout=90)
     res.raise_for_status()
     return res.json()
 
