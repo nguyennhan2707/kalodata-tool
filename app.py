@@ -318,7 +318,7 @@ def render_dashboard_section(key_prefix: str, region_code: str, lang_code: str, 
         df_dash = load_dashboard_data()
 
         if df_dash.empty:
-            st.info("Chưa có dữ liệu Dashboard trong Google Sheets. Hãy bấm **Chạy Bước 1 & 2** để bắt đầu.")
+            st.info("Chưa có dữ liệu Dashboard trong Google Sheets. Hãy chạy **Bước 1 → Bước 2** để bắt đầu.")
             return
 
         batches = sorted(df_dash["Đợt chạy"].astype(str).unique().tolist(), reverse=True)
@@ -499,7 +499,6 @@ def render_dashboard_section(key_prefix: str, region_code: str, lang_code: str, 
 st.title("Tool Săn Sản Phẩm TikTok Shop")
 df_master = load_master_data()
 
-# Khởi tạo giá trị mặc định cho 2 ô khoảng đơn giá
 if "price_from_str" not in st.session_state:
     st.session_state["price_from_str"] = "25.000"
 if "price_to_str" not in st.session_state:
@@ -597,7 +596,7 @@ with st.sidebar:
         "Sắp xếp theo",
         list(sort_field_options.keys()),
         index=0,
-        help="Tiêu chí xếp hạng bắt buộc để Kalodata trả về Top 100 sản phẩm tương ứng."
+        help="Tiêu chí xếp hạng bắt buộc để Kalodata trả về Top sản phẩm tương ứng."
     )
     st.caption(f"💡 {sort_field_desc[sort_field_label]}")
 
@@ -705,12 +704,12 @@ with st.sidebar:
         region_label = st.selectbox("Quốc gia / Thị trường", list(region_options.keys()), index=0)
         region_code, lang_code, curr_code = region_options[region_label]
 
-        page_size = st.number_input("Số sản phẩm/lần gọi (Tối đa 100 = 0.1 điểm)", min_value=1, max_value=100, value=100)
+        page_size = st.number_input("Số sản phẩm/lần gọi (Tối đa 100 = 0.1 điểm)", min_value=1, max_value=100, value=50)
         page_number = st.number_input("Số trang", min_value=1, value=1)
         need_image = st.checkbox("Lấy link ảnh sản phẩm (Miễn phí)", value=True)
         need_extra = st.checkbox("Lấy thêm Tên Shop & Số SKU (Miễn phí)", value=True)
 
-# Xây dựng payload chung cho /product/rank (đã bỏ dấu chấm ở khoảng giá)
+# Xây dựng payload chung cho /product/rank
 api_payload = {
     "region": region_code,
     "language": lang_code,
@@ -754,7 +753,7 @@ if revenue_range.strip():
 # --- 5 TAB CHÍNH ---
 tab_dash, tab_batch, tab_quick, tab_data, tab_master = st.tabs([
     "📊 Dashboard & Biểu đồ",
-    "🚀 Chạy Batch Tuần (Bước 1 & 2)",
+    "🚀 Chạy Batch Tuần (Bước 1 → 2)",
     "⚡ Lấy nhanh Top 100",
     "🗂️ Kho lưu trữ (Data)",
     "🧠 Quản lý Master Data"
@@ -773,44 +772,45 @@ with tab_dash:
     render_dashboard_section("tab_dash", region_code, lang_code, curr_code, date_range)
 
 # ==========================================
-# TAB 2: CHẠY BATCH TUẦN (BƯỚC 1 & 2 + GIỮ NGUYÊN DASHBOARD & CHART)
+# TAB 2: CHẠY BATCH TUẦN (TÁCH RIÊNG BƯỚC 1 & BƯỚC 2 + GIỮ NGUYÊN DASHBOARD)
 # ==========================================
 with tab_batch:
-    st.subheader("🚀 Chạy Batch săn sản phẩm hàng tuần (Bước 1 & 2)")
+    st.subheader("🚀 Chạy Batch săn sản phẩm hàng tuần (Tách riêng Bước 1 & Bước 2)")
     cat_summary = " > ".join(selected_cat_path) if selected_cat_path else (manual_cat_ids or "Tất cả ngành")
     st.info(
         f"**Cấu hình bộ lọc bên trái hiện tại:**\n"
-        f"- Ngành hàng: **{cat_summary}** | Thời gian: **{date_label}**\n"
-        f"- Hoa hồng: **{commission or 'Tất cả'}** | Khoảng giá: **{price_display}**"
+        f"- Ngành hàng: **{cat_summary}** | Thời gian: **{date_label}** | Sắp xếp: **{sort_field_label}**\n"
+        f"- Hoa hồng: **{commission or 'Tất cả'}** | Khoảng giá: **{price_display}** | Số SP quét: **{int(page_size)}**"
     )
 
+    # --- KHUNG BƯỚC 1 ---
     with st.container(border=True):
-        st.markdown("**Luồng tự động:** Quét Top 100 SP (`/product/rank`) → Lọc sơ bộ → Gọi chi tiết (`/product/detail`) lấy Số NST & Biểu đồ xu hướng cho Top SP tiềm năng nhất → Lưu vào Google Sheets.")
+        st.markdown("#### 1️⃣ Bước 1: Quét danh sách ứng viên (`/product/rank` — 0.1 điểm)")
         c_p1, c_p2, c_p3 = st.columns(3)
         max_sales_filter = c_p1.number_input("Lọc sơ bộ: Lượt bán tối đa (<)", min_value=100, value=3000, step=500)
         min_growth_filter = c_p2.number_input("Lọc sơ bộ: Tăng trưởng tối thiểu (%)", value=0.0, step=5.0)
-        top_n_detail = c_p3.number_input("Số SP lấy chi tiết ở Bước 2", min_value=1, max_value=30, value=20)
+        default_tick_n = c_p3.number_input("Mặc định tick sẵn Top SP", min_value=1, max_value=50, value=20)
 
-        max_cost_b12 = 0.1 + top_n_detail * 0.1
-        if st.button(f"🚀 Chạy Bước 1 & 2 (Tối đa {max_cost_b12:.1f} điểm)", type="primary", disabled=price_invalid):
-            st.session_state["confirm_b12"] = True
+        if st.button("🔍 Chạy Bước 1: Quét danh sách ứng viên (0.1 điểm)", type="primary", disabled=price_invalid):
+            st.session_state["confirm_b1"] = True
 
-        if st.session_state.get("confirm_b12") and not price_invalid:
+        if st.session_state.get("confirm_b1") and not price_invalid:
             st.warning(
-                f"⚠️ **Xác nhận gọi API Bước 1 & 2:**\n"
+                f"⚠️ **Xác nhận gọi API Bước 1 (`/product/rank`):**\n"
                 f"- Ngành hàng: **{cat_summary}** | Khoảng giá: **{price_display}** | Thời gian: **{date_label}**\n"
-                f"- Chi phí tối đa: **{max_cost_b12:.1f} điểm** (~{int(max_cost_b12 * 3000):,}đ)"
+                f"- Chi phí: **0.1 điểm** (~300đ) — Chưa gọi Bước 2."
             )
             col_cf1, col_cf2, _ = st.columns([1.2, 1, 4])
-            if col_cf1.button("✅ Xác nhận chạy", key="exec_b12", type="primary"):
-                st.session_state["confirm_b12"] = False
+            if col_cf1.button("✅ Xác nhận chạy Bước 1", key="exec_b1", type="primary"):
+                st.session_state["confirm_b1"] = False
                 try:
-                    with st.spinner("Bước 1: Đang quét Top 100 sản phẩm (/product/rank)..."):
+                    with st.spinner("Đang quét danh sách sản phẩm (/product/rank)..."):
                         res_rank = call_kalodata_api("product/rank", api_payload)
                         items = res_rank.get("data", [])
 
                     if not items:
                         st.warning("Bước 1 không trả về sản phẩm nào khớp bộ lọc.")
+                        st.session_state.pop("step1_candidates", None)
                     else:
                         added_m = save_master_entries(extract_master_entries_from_api(items))
                         if added_m > 0:
@@ -822,70 +822,162 @@ with tab_batch:
                             and (it.get("revenue_growth_rate") or 0) > min_growth_filter
                         ]
                         candidates.sort(key=lambda x: x.get("video_revenue") or 0, reverse=True)
-                        top_candidates = candidates[:int(top_n_detail)]
 
-                        if not top_candidates:
-                            st.warning(f"Có {len(items)} SP từ Bước 1 nhưng không SP nào thỏa điều kiện Lượt bán < {max_sales_filter} và Tăng trưởng > {min_growth_filter}%.")
+                        if not candidates:
+                            st.warning(
+                                f"Bước 1 quét được {len(items)} SP nhưng không SP nào thỏa điều kiện "
+                                f"Lượt bán < {max_sales_filter:,} và Tăng trưởng > {min_growth_filter}%. "
+                                "Hãy nới rộng bộ lọc sơ bộ rồi thử lại."
+                            )
+                            st.session_state.pop("step1_candidates", None)
                         else:
-                            st.info(f"Bước 1 lọc được **{len(candidates)}** SP đạt chuẩn. Đang chạy Bước 2 lấy chi tiết cho **Top {len(top_candidates)}** SP...")
-                            progress_bar = st.progress(0)
-                            crawl_time = now_vn().strftime("%Y-%m-%d %H:%M")
-                            dash_rows = []
-
-                            for idx, item in enumerate(top_candidates):
-                                pid = str(item.get("product_id", ""))
-                                detail_payload = {
-                                    "region": region_code,
-                                    "language": lang_code,
-                                    "currency": curr_code,
-                                    "date_range": date_range,
-                                    "product_id": pid,
-                                    "need_image": 0,
-                                    "need_extra": False
-                                }
-                                try:
-                                    d_res = call_kalodata_api("product/detail", detail_payload)
-                                    d_data = d_res.get("data") or {}
-                                except Exception:
-                                    d_data = {}
-
-                                pri = item.get("pri_category") or {}
-                                sec = item.get("sec_category") or {}
-                                trend_list = d_data.get("revenue_trend") or []
-
-                                dash_rows.append([
-                                    crawl_time,
-                                    item.get("master_image_url", ""),
-                                    pid,
-                                    item.get("product_name", ""),
-                                    to_int(item.get("unit_price", 0)),
-                                    round(parse_vn_num(item.get("commission_rate", 0)), 1),
-                                    to_int(item.get("sales_volumn", 0)),
-                                    to_int(item.get("video_revenue", 0)),
-                                    to_int(item.get("revenue", 0)),
-                                    round(parse_vn_num(item.get("revenue_growth_rate", 0)), 1),
-                                    to_int(d_data.get("creator_number", 0)),
-                                    to_int(d_data.get("video_number", 0)),
-                                    to_int(d_data.get("product_review_count", 0)),
-                                    json.dumps(trend_list),
-                                    pri.get("category_name", ""),
-                                    sec.get("category_name", ""),
-                                    item.get("seller_name", ""),
-                                    "Chưa check", 0, 0, "Chưa check", 0
-                                ])
-                                progress_bar.progress((idx + 1) / len(top_candidates))
-                                time.sleep(0.15)
-
-                            dash_ws = get_dashboard_sheet()
-                            dash_ws.append_rows(dash_rows, value_input_option="RAW")
-                            load_dashboard_data.clear()
-                            st.success(f"✅ Hoàn tất lúc {crawl_time}! Đã lưu **{len(dash_rows)} SP** (tốn {0.1 + len(dash_rows)*0.1:.1f} điểm).")
-                            st.rerun()
+                            st.session_state["step1_candidates"] = candidates
+                            st.session_state["step1_meta"] = {
+                                "time": now_vn().strftime("%Y-%m-%d %H:%M"),
+                                "total_raw": len(items),
+                                "default_tick": int(default_tick_n),
+                                "region": region_code,
+                                "lang": lang_code,
+                                "curr": curr_code,
+                                "date_range": date_range,
+                            }
+                            st.success(f"✅ Bước 1 hoàn tất! Lọc được **{len(candidates)} / {len(items)}** sản phẩm đạt chuẩn. Hãy rà soát và tick chọn ở Bước 2 bên dưới.")
                 except Exception as e:
-                    st.error(f"Lỗi khi chạy Batch Bước 1 & 2: {e}")
-            if col_cf2.button("❌ Hủy", key="cancel_b12"):
-                st.session_state["confirm_b12"] = False
+                    st.error(f"Lỗi khi chạy Bước 1: {e}")
+            if col_cf2.button("❌ Hủy", key="cancel_b1"):
+                st.session_state["confirm_b1"] = False
                 st.rerun()
+
+    # --- KHUNG BƯỚC 2 (CHỈ HIỆN KHI ĐÃ CÓ KẾT QUẢ BƯỚC 1) ---
+    if st.session_state.get("step1_candidates"):
+        candidates = st.session_state["step1_candidates"]
+        meta = st.session_state.get("step1_meta", {})
+        default_tick = meta.get("default_tick", 20)
+
+        with st.container(border=True):
+            st.markdown(f"#### 2️⃣ Bước 2: Rà soát ứng viên & Lấy chi tiết (`/product/detail`)")
+            st.caption(
+                f"Đợt quét lúc `{meta.get('time', '')}` — Có **{len(candidates)}** ứng viên. "
+                f"Mặc định tick sẵn Top **{min(default_tick, len(candidates))}** SP đầu tiên. Bỏ tick những SP không ưng trước khi bấm chạy."
+            )
+
+            cand_rows = []
+            for idx, item in enumerate(candidates):
+                pri = item.get("pri_category") or {}
+                sec = item.get("sec_category") or {}
+                cand_rows.append({
+                    "Chọn lấy chi tiết": idx < default_tick,
+                    "Ảnh SP": item.get("master_image_url", ""),
+                    "Mã SP": str(item.get("product_id", "")),
+                    "Tên sản phẩm": item.get("product_name", ""),
+                    "Đơn giá (VNĐ)": to_int(item.get("unit_price", 0)),
+                    "Hoa hồng (%)": round(parse_vn_num(item.get("commission_rate", 0)), 1),
+                    "Lượt bán": to_int(item.get("sales_volumn", 0)),
+                    "Doanh thu Video": to_int(item.get("video_revenue", 0)),
+                    "Tổng doanh thu": to_int(item.get("revenue", 0)),
+                    "Tăng trưởng (%)": round(parse_vn_num(item.get("revenue_growth_rate", 0)), 1),
+                    "Ngành cấp 1": pri.get("category_name", ""),
+                    "Ngành cấp 2": sec.get("category_name", ""),
+                    "Tên Shop": item.get("seller_name", ""),
+                })
+
+            df_cand = pd.DataFrame(cand_rows)
+            edited_cand = st.data_editor(
+                df_cand,
+                column_config={
+                    "Chọn lấy chi tiết": st.column_config.CheckboxColumn("Chọn lấy chi tiết", default=True),
+                    **COLUMN_CONFIG
+                },
+                disabled=[c for c in df_cand.columns if c != "Chọn lấy chi tiết"],
+                use_container_width=True,
+                height=420,
+                hide_index=True,
+                key=f"step1_editor_{meta.get('time', '')}"
+            )
+
+            chosen_pids = set(edited_cand[edited_cand["Chọn lấy chi tiết"] == True]["Mã SP"].astype(str).tolist())
+            cost_b2 = len(chosen_pids) * 0.1
+
+            col_b2_run, col_b2_clr, _ = st.columns([2.2, 1.2, 2])
+            if col_b2_run.button(
+                f"🚀 Chạy Bước 2 cho {len(chosen_pids)} SP đã chọn ({cost_b2:.1f} điểm)",
+                type="primary",
+                disabled=len(chosen_pids) == 0
+            ):
+                st.session_state["confirm_b2"] = True
+
+            if col_b2_clr.button("🗑️ Xóa danh sách tạm"):
+                st.session_state.pop("step1_candidates", None)
+                st.session_state["confirm_b2"] = False
+                st.rerun()
+
+            if st.session_state.get("confirm_b2") and len(chosen_pids) > 0:
+                st.warning(
+                    f"⚠️ **Xác nhận gọi API Bước 2 (`/product/detail`)** cho **{len(chosen_pids)}** sản phẩm đã tick?\n"
+                    f"- Chi phí chính xác: **{cost_b2:.1f} điểm** (~{int(cost_b2 * 3000):,}đ)."
+                )
+                c2_1, c2_2, _ = st.columns([1.2, 1, 4])
+                if c2_1.button("✅ Xác nhận chạy Bước 2", key="exec_b2", type="primary"):
+                    st.session_state["confirm_b2"] = False
+                    selected_items = [it for it in candidates if str(it.get("product_id", "")) in chosen_pids]
+                    progress_bar = st.progress(0)
+                    crawl_time = now_vn().strftime("%Y-%m-%d %H:%M")
+                    dash_rows = []
+
+                    for idx, item in enumerate(selected_items):
+                        pid = str(item.get("product_id", ""))
+                        detail_payload = {
+                            "region": meta.get("region", region_code),
+                            "language": meta.get("lang", lang_code),
+                            "currency": meta.get("curr", curr_code),
+                            "date_range": meta.get("date_range", date_range),
+                            "product_id": pid,
+                            "need_image": 0,
+                            "need_extra": False
+                        }
+                        try:
+                            d_res = call_kalodata_api("product/detail", detail_payload)
+                            d_data = d_res.get("data") or {}
+                        except Exception:
+                            d_data = {}
+
+                        pri = item.get("pri_category") or {}
+                        sec = item.get("sec_category") or {}
+                        trend_list = d_data.get("revenue_trend") or []
+
+                        dash_rows.append([
+                            crawl_time,
+                            item.get("master_image_url", ""),
+                            pid,
+                            item.get("product_name", ""),
+                            to_int(item.get("unit_price", 0)),
+                            round(parse_vn_num(item.get("commission_rate", 0)), 1),
+                            to_int(item.get("sales_volumn", 0)),
+                            to_int(item.get("video_revenue", 0)),
+                            to_int(item.get("revenue", 0)),
+                            round(parse_vn_num(item.get("revenue_growth_rate", 0)), 1),
+                            to_int(d_data.get("creator_number", 0)),
+                            to_int(d_data.get("video_number", 0)),
+                            to_int(d_data.get("product_review_count", 0)),
+                            json.dumps(trend_list),
+                            pri.get("category_name", ""),
+                            sec.get("category_name", ""),
+                            item.get("seller_name", ""),
+                            "Chưa check", 0, 0, "Chưa check", 0
+                        ])
+                        progress_bar.progress((idx + 1) / len(selected_items))
+                        time.sleep(0.15)
+
+                    dash_ws = get_dashboard_sheet()
+                    dash_ws.append_rows(dash_rows, value_input_option="RAW")
+                    load_dashboard_data.clear()
+                    st.session_state.pop("step1_candidates", None)
+                    st.success(f"✅ Hoàn tất Bước 2 lúc {crawl_time}! Đã lưu **{len(dash_rows)} SP** vào Dashboard.")
+                    st.rerun()
+
+                if c2_2.button("❌ Hủy", key="cancel_b2"):
+                    st.session_state["confirm_b2"] = False
+                    st.rerun()
 
     st.markdown("---")
     st.subheader("📈 Kết quả Dashboard & Biểu đồ")
