@@ -6,9 +6,15 @@ import requests
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 st.set_page_config(page_title="Săn Sản Phẩm Affiliate", layout="wide")
+
+# Múi giờ Việt Nam (UTC+7)
+VN_TZ = timezone(timedelta(hours=7))
+
+def now_vn() -> datetime:
+    return datetime.now(VN_TZ)
 
 # --- 1. KẾT NỐI GOOGLE SHEETS ---
 @st.cache_resource
@@ -55,7 +61,7 @@ def get_dashboard_sheet():
         ws.append_row(DASHBOARD_HEADERS)
         return ws
 
-# --- 2. ĐỒNG BỘ MASTER DATA ---
+# --- 2. ĐỒNG BỘ MASTER DATA & CACHE DỮ LIỆU ---
 EXCLUDED_AUTO_FIELDS = {
     "product_id", "product_name", "master_image_url", "revenue", "commission_rate",
     "revenue_growth_rate", "sales_volumn", "unit_price", "live_revenue",
@@ -113,7 +119,7 @@ def save_master_entries(entries: list) -> int:
             seen.add(key)
             new_rows.append([loai, ma_id, ten, ma_cha])
     if new_rows:
-        ws.append_rows(new_rows)
+        ws.append_rows(new_rows, value_input_option="RAW")
     return len(new_rows)
 
 @st.cache_data(ttl=300)
@@ -126,6 +132,14 @@ def load_master_data() -> pd.DataFrame:
     for col in df_m.columns:
         df_m[col] = df_m[col].str.strip()
     return df_m
+
+@st.cache_data(ttl=120)
+def load_dashboard_data() -> pd.DataFrame:
+    ws = get_dashboard_sheet()
+    records = ws.get_all_records()
+    if not records:
+        return pd.DataFrame(columns=DASHBOARD_HEADERS)
+    return pd.DataFrame(records)
 
 # --- 3. CÁC HÀM GỌI API & XỬ LÝ DỮ LIỆU ---
 def call_kalodata_api(endpoint: str, payload: dict):
@@ -150,6 +164,12 @@ def parse_trend_list(val) -> list:
             parts = [p.strip() for p in val.strip("[]").split(",") if p.strip()]
             return [float(p) for p in parts if p.replace(".", "", 1).replace("-", "", 1).isdigit()]
     return []
+
+def to_int(val) -> int:
+    try:
+        return int(round(float(val or 0)))
+    except Exception:
+        return 0
 
 # --- POPUP HIỂN THỊ CHI TIẾT SẢN PHẨM KHI CLICK CỘT ---
 @st.dialog("📦 Chi tiết sản phẩm", width="large")
@@ -232,7 +252,187 @@ def filter_dataframe(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
                         df = df[df[col].astype(str).str.contains(search_text.strip(), case=False, na=False)]
     return df
 
-# --- 5. GIAO DIỆN WEB ---
+# --- 5. HÀM DÙNG CHUNG: HIỂN THỊ DASHBOARD + BIỂU ĐỒ + BƯỚC 3 ---
+def render_dashboard_section(key_prefix: str, region_code: str, lang_code: str, curr_code: str, date_range: str):
+    try:
+        df_dash = load_dashboard_data()
+
+        if df_dash.empty:
+            st.info("Chưa có dữ liệu Dashboard trong Google Sheets. Hãy bấm **Chạy Bước 1 & 2** để bắt đầu.")
+            return
+
+        batches = sorted(df_dash["Đợt chạy"].astype(str).unique().tolist(), reverse=True)
+        sel_batch = st.selectbox("📅 Chọn đợt chạy:", batches, key=f"{key_prefix}_batch")
+        df_b = df_dash[df_dash["Đợt chạy"].astype(str) == sel_batch].copy()
+
+        # Thanh lọc nhanh trên Dashboard
+        f1, f2, f3 = st.columns(3)
+        max_nst_val = int(pd.to_numeric(df_b["Số NST"], errors="coerce").max() or 100)
+        nst_upper = max(max_nst_val, 100)
+        nst_range = f1.slider(
+            "Lọc Số Nhà sáng tạo (creator_number)",
+            min_value=0, max_value=nst_upper,
+            value=(0, nst_upper),
+            key=f"{key_prefix}_nst_{sel_batch}"
+        )
+        ads_filter = f2.selectbox("Trạng thái Ads", ["Tất cả", "Có", "Không", "Chưa check"], key=f"{key_prefix}_ads")
+        ai_filter = f3.selectbox("Có Video AI?", ["Tất cả", "Có", "Không", "Chưa check"], key=f"{key_prefix}_ai")
+
+        df_b["Số NST_num"] = pd.to_numeric(df_b["Số NST"], errors="coerce").fillna(0)
+        df_b = df_b[df_b["Số NST_num"].between(nst_range[0], nst_range[1])]
+        if ads_filter != "Tất cả":
+            df_b = df_b[df_b["Có chạy Ads"].astype(str) == ads_filter]
+        if ai_filter != "Tất cả":
+            df_b = df_b[df_b["Có Video AI"].astype(str) == ai_filter]
+
+        df_b["Xu hướng doanh thu"] = df_b["Xu hướng doanh thu"].apply(parse_trend_list)
+
+        # --- BIỂU ĐỒ CỘT TỪ THẤP ĐẾN CAO (CLICK ĐỂ MỞ POPUP) ---
+        if not df_b.empty:
+            st.markdown("#### 📊 Biểu đồ xếp hạng sản phẩm tiềm năng (Thấp → Cao)")
+            st.caption("💡 Bấm trực tiếp vào bất kỳ cột sản phẩm nào trên biểu đồ để mở **Popup chi tiết đầy đủ**.")
+
+            chart_metric = st.selectbox(
+                "Chọn chỉ số xếp hạng trên biểu đồ:",
+                ["Doanh thu Video", "Lượt bán", "Tăng trưởng (%)", "Hoa hồng (%)", "Tổng doanh thu"],
+                index=0,
+                key=f"{key_prefix}_metric"
+            )
+
+            df_chart = df_b.copy()
+            df_chart[chart_metric] = pd.to_numeric(df_chart[chart_metric], errors="coerce").fillna(0)
+            df_chart["Mã SP"] = df_chart["Mã SP"].astype(str)
+            df_chart["Tên ngắn"] = df_chart.apply(
+                lambda r: f"{str(r['Tên sản phẩm'])[:18]}... ({str(r['Mã SP'])[-4:]})", axis=1
+            )
+
+            point_sel = alt.selection_point(name=f"sel_{key_prefix}", fields=["Mã SP"])
+            bar_chart = (
+                alt.Chart(df_chart)
+                .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+                .encode(
+                    x=alt.X(
+                        "Tên ngắn:N",
+                        sort=alt.EncodingSortField(field=chart_metric, order="ascending"),
+                        title="Sản phẩm (Xếp từ thấp → cao)",
+                        axis=alt.Axis(labelAngle=-35)
+                    ),
+                    y=alt.Y(f"{chart_metric}:Q", title=chart_metric),
+                    color=alt.condition(point_sel, alt.value("#FF4B4B"), alt.value("#4C78A8")),
+                    tooltip=[
+                        "Tên sản phẩm", "Mã SP", "Đơn giá (VNĐ)", "Hoa hồng (%)",
+                        "Lượt bán", "Số NST", "Doanh thu Video", "Tăng trưởng (%)"
+                    ]
+                )
+                .add_params(point_sel)
+                .properties(height=380)
+            )
+
+            chart_event = st.altair_chart(bar_chart, use_container_width=True, on_select="rerun", key=f"{key_prefix}_chart")
+
+            sel_list = chart_event.selection.get(f"sel_{key_prefix}", []) if chart_event and chart_event.selection else []
+            token_key = f"last_clicked_{key_prefix}"
+            if sel_list:
+                clicked_pid = str(sel_list[0].get("Mã SP", ""))
+                click_token = f"{sel_batch}_{clicked_pid}"
+                if clicked_pid and click_token != st.session_state.get(token_key):
+                    st.session_state[token_key] = click_token
+                    matched = df_b[df_b["Mã SP"].astype(str) == clicked_pid]
+                    if not matched.empty:
+                        show_product_popup(matched.iloc[0])
+            else:
+                st.session_state[token_key] = None
+
+        # --- BẢNG DỮ LIỆU & BƯỚC 3 ---
+        st.markdown("#### 📋 Bảng danh sách & Bước 3 (Check Ads + Video AI)")
+        df_b_tbl = df_b.copy()
+        df_b_tbl.insert(0, "Chọn check Ads", False)
+        df_b_display = df_b_tbl.drop(columns=["Số NST_num", "Đợt chạy"])
+
+        st.caption(f"Đang hiển thị **{len(df_b_display)}** sản phẩm của đợt `{sel_batch}`. Tick vào cột **Chọn check Ads** rồi bấm nút Bước 3 bên dưới.")
+        edited_df = st.data_editor(
+            df_b_display,
+            column_config={
+                "Chọn check Ads": st.column_config.CheckboxColumn("Chọn check Ads", default=False),
+                **COLUMN_CONFIG
+            },
+            disabled=[c for c in df_b_display.columns if c != "Chọn check Ads"],
+            use_container_width=True,
+            height=500,
+            hide_index=True,
+            key=f"{key_prefix}_editor_{sel_batch}"
+        )
+
+        selected_pids = edited_df[edited_df["Chọn check Ads"] == True]["Mã SP"].astype(str).tolist()
+        cost_b3 = len(selected_pids) * 0.1
+        confirm_key = f"confirm_b3_{key_prefix}"
+
+        if st.button(
+            f"🔥 Chạy Bước 3: Check Ads & Video AI cho {len(selected_pids)} SP đã chọn ({cost_b3:.1f} điểm)",
+            disabled=len(selected_pids) == 0,
+            key=f"btn_b3_{key_prefix}"
+        ):
+            st.session_state[confirm_key] = True
+
+        if st.session_state.get(confirm_key) and len(selected_pids) > 0:
+            st.warning(f"⚠️ **Xác nhận check Ads & Video AI** cho **{len(selected_pids)}** sản phẩm đã chọn? Chi phí: **{cost_b3:.1f} điểm** (~{int(cost_b3 * 3000):,}đ).")
+            c3_1, c3_2, _ = st.columns([1.2, 1, 4])
+            if c3_1.button("✅ Xác nhận check", key=f"exec_b3_{key_prefix}", type="primary"):
+                st.session_state[confirm_key] = False
+                prog3 = st.progress(0)
+                dash_ws = get_dashboard_sheet()
+                all_sheet_vals = dash_ws.get_all_values()
+                header_row = all_sheet_vals[0]
+                col_idx_batch = header_row.index("Đợt chạy")
+                col_idx_pid = header_row.index("Mã SP")
+                col_idx_ads_start = header_row.index("Có chạy Ads") + 1
+
+                for idx, pid in enumerate(selected_pids):
+                    v_payload = {
+                        "region": region_code,
+                        "language": lang_code,
+                        "currency": curr_code,
+                        "date_range": date_range,
+                        "sort_field": {"field": "revenue", "type": "DESC"},
+                        "page_size": 50,
+                        "page_number": 1,
+                        "product_id": pid
+                    }
+                    try:
+                        v_res = call_kalodata_api("video/rank", v_payload)
+                        vids = v_res.get("data") or []
+                    except Exception:
+                        vids = []
+
+                    ads_vids = [v for v in vids if v.get("ad") == 1]
+                    ai_vids = [v for v in vids if v.get("ai_video") == 1]
+                    max_roas = max([float(v.get("ads_roas") or 0) for v in ads_vids], default=0.0)
+
+                    has_ads = "Có" if ads_vids else "Không"
+                    has_ai = "Có" if ai_vids else "Không"
+
+                    for r_i, r_val in enumerate(all_sheet_vals[1:], start=2):
+                        if str(r_val[col_idx_batch]) == sel_batch and str(r_val[col_idx_pid]) == pid:
+                            dash_ws.update(
+                                values=[[has_ads, len(ads_vids), round(max_roas, 2), has_ai, len(ai_vids)]],
+                                range_name=gspread.utils.rowcol_to_a1(r_i, col_idx_ads_start),
+                                value_input_option="RAW"
+                            )
+                            break
+
+                    prog3.progress((idx + 1) / len(selected_pids))
+                    time.sleep(1.1)
+
+                load_dashboard_data.clear()
+                st.success(f"Đã check xong Ads & Video AI cho {len(selected_pids)} sản phẩm!")
+                st.rerun()
+            if c3_2.button("❌ Hủy", key=f"cancel_b3_{key_prefix}"):
+                st.session_state[confirm_key] = False
+                st.rerun()
+    except Exception as e:
+        st.error(f"Lỗi tải Dashboard: {e}")
+
+# --- 6. GIAO DIỆN WEB ---
 st.title("Tool Săn Sản Phẩm TikTok Shop")
 
 COLUMN_CONFIG = {
@@ -265,7 +465,9 @@ with st.sidebar:
         st.caption("Chưa có Master Data ngành hàng. Hãy gọi API 1 lần để tự động lưu.")
     else:
         c1_map = dict(zip(df_c1_all["ten_hien_thi"], df_c1_all["ma_id"]))
-        sel_c1_name = st.selectbox("Ngành cấp 1", ["Tất cả"] + sorted(c1_map.keys()))
+        c1_options = ["Tất cả"] + sorted(c1_map.keys())
+        default_c1_idx = c1_options.index("Đồ ăn & Đồ uống") if "Đồ ăn & Đồ uống" in c1_options else 0
+        sel_c1_name = st.selectbox("Ngành cấp 1", c1_options, index=default_c1_idx)
 
         if sel_c1_name != "Tất cả":
             c1_id = c1_map[sel_c1_name]
@@ -305,7 +507,7 @@ with st.sidebar:
     }
     date_label = st.selectbox("Khoảng thời gian", list(date_options.keys()), index=1)
     if date_options[date_label] == "custom":
-        today = datetime.now().date()
+        today = now_vn().date()
         col_d1, col_d2 = st.columns(2)
         start_d = col_d1.date_input("Từ ngày", today - timedelta(days=7))
         end_d = col_d2.date_input("Đến ngày", today - timedelta(days=1))
@@ -331,7 +533,7 @@ with st.sidebar:
 
     keyword = st.text_input("Từ khóa tìm kiếm", value="", placeholder="VD: bánh tráng, khô gà...")
     commission = st.text_input("Tỷ lệ hoa hồng (%)", value=">=10", help="VD: >=10, 15-35, <20")
-    price_range = st.text_input("Khoảng đơn giá", value="25000-150000", help="VD: 25000-150000")
+    price_range = st.text_input("Khoảng đơn giá", value="25000-150000", help="Xóa trống để lấy mọi mức giá")
 
     with st.expander("🎯 Bộ lọc nâng cao (Shop, Affiliate, Vận chuyển)"):
         df_shop_all = df_master[df_master["loai_du_lieu"] == "shop"]
@@ -434,335 +636,228 @@ if launch_options[launch_label] is not None:
 if revenue_range.strip():
     api_payload["revenue_range"] = revenue_range.strip()
 
-# --- 4 TAB CHÍNH ---
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🎯 Săn SP Win (Dashboard Tuần)",
-    "⚡ Lấy nhanh Top 100 (API đơn)",
-    "📊 Kho lưu trữ (Data)",
+# --- 5 TAB CHÍNH ---
+tab_dash, tab_batch, tab_quick, tab_data, tab_master = st.tabs([
+    "📊 Dashboard & Biểu đồ",
+    "🚀 Chạy Batch Tuần (Bước 1 & 2)",
+    "⚡ Lấy nhanh Top 100",
+    "🗂️ Kho lưu trữ (Data)",
     "🧠 Quản lý Master Data"
 ])
 
 # ==========================================
-# TAB 1: DASHBOARD TUẦN (BIỂU ĐỒ CỘT + POPUP + LUỒNG 3 BƯỚC)
+# TAB 1: DASHBOARD & BIỂU ĐỒ (XEM LẠI DỮ LIỆU CŨ)
 # ==========================================
-with tab1:
-    st.subheader("Luồng chạy Batch hàng tuần (3 bước — ~3.1 điểm / 9.300đ)")
+with tab_dash:
+    col_head, col_reload = st.columns([4, 1])
+    col_head.subheader("📈 Dashboard Phân tích & Biểu đồ xếp hạng (Lưu vĩnh viễn)")
+    if col_reload.button("🔄 Tải lại dữ liệu", use_container_width=True, key="reload_tab1"):
+        load_dashboard_data.clear()
+        st.rerun()
+
+    render_dashboard_section("tab_dash", region_code, lang_code, curr_code, date_range)
+
+# ==========================================
+# TAB 2: CHẠY BATCH TUẦN (BƯỚC 1 & 2 + GIỮ NGUYÊN DASHBOARD & CHART)
+# ==========================================
+with tab_batch:
+    st.subheader("🚀 Chạy Batch săn sản phẩm hàng tuần (Bước 1 & 2)")
+    cat_summary = " > ".join(selected_cat_path) if selected_cat_path else (manual_cat_ids or "Tất cả ngành")
+    st.info(
+        f"**Cấu hình bộ lọc bên trái hiện tại:**\n"
+        f"- Ngành hàng: **{cat_summary}** | Thời gian: **{date_label}**\n"
+        f"- Hoa hồng: **{commission or 'Tất cả'}** | Khoảng giá: **{price_range or 'Tất cả'}**"
+    )
+
     with st.container(border=True):
-        st.markdown("**Bước 1 & 2 (Tự động):** Quét Top 100 SP theo bộ lọc bên trái $\\rightarrow$ Lọc sơ bộ $\\rightarrow$ Lấy Số NST & Biểu đồ xu hướng cho Top 20 SP.")
+        st.markdown("**Luồng tự động:** Quét Top 100 SP (`/product/rank`) → Lọc sơ bộ → Gọi chi tiết (`/product/detail`) lấy Số NST & Biểu đồ xu hướng cho Top SP tiềm năng nhất → Lưu vào Google Sheets.")
         c_p1, c_p2, c_p3 = st.columns(3)
         max_sales_filter = c_p1.number_input("Lọc sơ bộ: Lượt bán tối đa (<)", min_value=100, value=3000, step=500)
         min_growth_filter = c_p2.number_input("Lọc sơ bộ: Tăng trưởng tối thiểu (%)", value=0.0, step=5.0)
         top_n_detail = c_p3.number_input("Số SP lấy chi tiết ở Bước 2", min_value=1, max_value=30, value=20)
 
-        if st.button(f"🚀 Chạy Bước 1 & 2 (Tối đa {0.1 + top_n_detail * 0.1:.1f} điểm)", type="primary"):
-            try:
-                with st.spinner("Bước 1: Đang quét Top 100 sản phẩm (/product/rank)..."):
-                    res_rank = call_kalodata_api("product/rank", api_payload)
-                    items = res_rank.get("data", [])
+        max_cost_b12 = 0.1 + top_n_detail * 0.1
+        if st.button(f"🚀 Chạy Bước 1 & 2 (Tối đa {max_cost_b12:.1f} điểm)", type="primary"):
+            st.session_state["confirm_b12"] = True
 
-                if not items:
-                    st.warning("Bước 1 không trả về sản phẩm nào khớp bộ lọc.")
-                else:
-                    added_m = save_master_entries(extract_master_entries_from_api(items))
-                    if added_m > 0:
-                        load_master_data.clear()
+        if st.session_state.get("confirm_b12"):
+            st.warning(
+                f"⚠️ **Xác nhận gọi API Bước 1 & 2:**\n"
+                f"- Ngành hàng: **{cat_summary}** | Thời gian: **{date_label}**\n"
+                f"- Chi phí tối đa: **{max_cost_b12:.1f} điểm** (~{int(max_cost_b12 * 3000):,}đ)"
+            )
+            col_cf1, col_cf2, _ = st.columns([1.2, 1, 4])
+            if col_cf1.button("✅ Xác nhận chạy", key="exec_b12", type="primary"):
+                st.session_state["confirm_b12"] = False
+                try:
+                    with st.spinner("Bước 1: Đang quét Top 100 sản phẩm (/product/rank)..."):
+                        res_rank = call_kalodata_api("product/rank", api_payload)
+                        items = res_rank.get("data", [])
 
-                    candidates = [
-                        it for it in items
-                        if (it.get("sales_volumn") or 0) < max_sales_filter
-                        and (it.get("revenue_growth_rate") or 0) > min_growth_filter
-                    ]
-                    candidates.sort(key=lambda x: x.get("video_revenue") or 0, reverse=True)
-                    top_candidates = candidates[:int(top_n_detail)]
-
-                    if not top_candidates:
-                        st.warning(f"Có {len(items)} SP từ Bước 1 nhưng không SP nào thỏa điều kiện Lượt bán < {max_sales_filter} và Tăng trưởng > {min_growth_filter}%.")
+                    if not items:
+                        st.warning("Bước 1 không trả về sản phẩm nào khớp bộ lọc.")
                     else:
-                        st.info(f"Bước 1 lọc được **{len(candidates)}** SP đạt chuẩn. Đang chạy Bước 2 lấy chi tiết cho **Top {len(top_candidates)}** SP...")
-                        progress_bar = st.progress(0)
-                        crawl_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-                        dash_rows = []
+                        added_m = save_master_entries(extract_master_entries_from_api(items))
+                        if added_m > 0:
+                            load_master_data.clear()
 
-                        for idx, item in enumerate(top_candidates):
-                            pid = str(item.get("product_id", ""))
-                            detail_payload = {
-                                "region": region_code,
-                                "language": lang_code,
-                                "currency": curr_code,
-                                "date_range": date_range,
-                                "product_id": pid,
-                                "need_image": 0,
-                                "need_extra": False
-                            }
-                            try:
-                                d_res = call_kalodata_api("product/detail", detail_payload)
-                                d_data = d_res.get("data") or {}
-                            except Exception:
-                                d_data = {}
+                        candidates = [
+                            it for it in items
+                            if (it.get("sales_volumn") or 0) < max_sales_filter
+                            and (it.get("revenue_growth_rate") or 0) > min_growth_filter
+                        ]
+                        candidates.sort(key=lambda x: x.get("video_revenue") or 0, reverse=True)
+                        top_candidates = candidates[:int(top_n_detail)]
 
-                            pri = item.get("pri_category") or {}
-                            sec = item.get("sec_category") or {}
-                            trend_list = d_data.get("revenue_trend") or []
+                        if not top_candidates:
+                            st.warning(f"Có {len(items)} SP từ Bước 1 nhưng không SP nào thỏa điều kiện Lượt bán < {max_sales_filter} và Tăng trưởng > {min_growth_filter}%.")
+                        else:
+                            st.info(f"Bước 1 lọc được **{len(candidates)}** SP đạt chuẩn. Đang chạy Bước 2 lấy chi tiết cho **Top {len(top_candidates)}** SP...")
+                            progress_bar = st.progress(0)
+                            crawl_time = now_vn().strftime("%Y-%m-%d %H:%M")
+                            dash_rows = []
 
-                            dash_rows.append([
-                                crawl_time,
-                                item.get("master_image_url", ""),
-                                pid,
-                                item.get("product_name", ""),
-                                item.get("unit_price", 0),
-                                item.get("commission_rate", 0),
-                                item.get("sales_volumn", 0),
-                                item.get("video_revenue", 0),
-                                item.get("revenue", 0),
-                                item.get("revenue_growth_rate", 0),
-                                d_data.get("creator_number", 0),
-                                d_data.get("video_number", 0),
-                                d_data.get("product_review_count", 0),
-                                json.dumps(trend_list),
-                                pri.get("category_name", ""),
-                                sec.get("category_name", ""),
-                                item.get("seller_name", ""),
-                                "Chưa check", 0, 0, "Chưa check", 0
-                            ])
-                            progress_bar.progress((idx + 1) / len(top_candidates))
-                            time.sleep(0.15)
+                            for idx, item in enumerate(top_candidates):
+                                pid = str(item.get("product_id", ""))
+                                detail_payload = {
+                                    "region": region_code,
+                                    "language": lang_code,
+                                    "currency": curr_code,
+                                    "date_range": date_range,
+                                    "product_id": pid,
+                                    "need_image": 0,
+                                    "need_extra": False
+                                }
+                                try:
+                                    d_res = call_kalodata_api("product/detail", detail_payload)
+                                    d_data = d_res.get("data") or {}
+                                except Exception:
+                                    d_data = {}
 
-                        dash_ws = get_dashboard_sheet()
-                        dash_ws.append_rows(dash_rows)
-                        st.success(f"Hoàn tất Bước 1 & 2! Đã lưu {len(dash_rows)} SP tiềm năng vào tab Weekly_Dashboard.")
-                        st.rerun()
-            except Exception as e:
-                st.error(f"Lỗi khi chạy Batch Bước 1 & 2: {e}")
+                                pri = item.get("pri_category") or {}
+                                sec = item.get("sec_category") or {}
+                                trend_list = d_data.get("revenue_trend") or []
+
+                                dash_rows.append([
+                                    crawl_time,
+                                    item.get("master_image_url", ""),
+                                    pid,
+                                    item.get("product_name", ""),
+                                    to_int(item.get("unit_price", 0)),
+                                    round(float(item.get("commission_rate", 0) or 0), 2),
+                                    to_int(item.get("sales_volumn", 0)),
+                                    to_int(item.get("video_revenue", 0)),
+                                    to_int(item.get("revenue", 0)),
+                                    round(float(item.get("revenue_growth_rate", 0) or 0), 2),
+                                    to_int(d_data.get("creator_number", 0)),
+                                    to_int(d_data.get("video_number", 0)),
+                                    to_int(d_data.get("product_review_count", 0)),
+                                    json.dumps(trend_list),
+                                    pri.get("category_name", ""),
+                                    sec.get("category_name", ""),
+                                    item.get("seller_name", ""),
+                                    "Chưa check", 0, 0, "Chưa check", 0
+                                ])
+                                progress_bar.progress((idx + 1) / len(top_candidates))
+                                time.sleep(0.15)
+
+                            dash_ws = get_dashboard_sheet()
+                            dash_ws.append_rows(dash_rows, value_input_option="RAW")
+                            load_dashboard_data.clear()
+                            st.success(f"✅ Hoàn tất lúc {crawl_time}! Đã lưu **{len(dash_rows)} SP** (tốn {0.1 + len(dash_rows)*0.1:.1f} điểm).")
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"Lỗi khi chạy Batch Bước 1 & 2: {e}")
+            if col_cf2.button("❌ Hủy", key="cancel_b12"):
+                st.session_state["confirm_b12"] = False
+                st.rerun()
 
     st.markdown("---")
-    st.subheader("📈 Dashboard Phân tích & Biểu đồ xếp hạng tuần")
-
-    try:
-        dash_ws = get_dashboard_sheet()
-        dash_records = dash_ws.get_all_records()
-
-        if not dash_records:
-            st.info("Chưa có dữ liệu Dashboard. Hãy bấm nút **Chạy Bước 1 & 2** ở trên để bắt đầu.")
-        else:
-            df_dash = pd.DataFrame(dash_records)
-            batches = sorted(df_dash["Đợt chạy"].astype(str).unique().tolist(), reverse=True)
-            sel_batch = st.selectbox("Chọn đợt chạy tuần", batches)
-            df_b = df_dash[df_dash["Đợt chạy"].astype(str) == sel_batch].copy()
-
-            # Thanh lọc nhanh trên Dashboard
-            f1, f2, f3 = st.columns(3)
-            max_nst_val = int(pd.to_numeric(df_b["Số NST"], errors="coerce").max() or 100)
-            nst_range = f1.slider(
-                "Lọc Số Nhà sáng tạo (creator_number)",
-                min_value=0, max_value=max(max_nst_val, 100),
-                value=(0, min(max(max_nst_val, 100), 100))
-            )
-            ads_filter = f2.selectbox("Trạng thái Ads", ["Tất cả", "Có", "Không", "Chưa check"])
-            ai_filter = f3.selectbox("Có Video AI?", ["Tất cả", "Có", "Không", "Chưa check"])
-
-            df_b["Số NST_num"] = pd.to_numeric(df_b["Số NST"], errors="coerce").fillna(0)
-            df_b = df_b[df_b["Số NST_num"].between(nst_range[0], nst_range[1])]
-            if ads_filter != "Tất cả":
-                df_b = df_b[df_b["Có chạy Ads"].astype(str) == ads_filter]
-            if ai_filter != "Tất cả":
-                df_b = df_b[df_b["Có Video AI"].astype(str) == ai_filter]
-
-            df_b["Xu hướng doanh thu"] = df_b["Xu hướng doanh thu"].apply(parse_trend_list)
-
-            # --- BIỂU ĐỒ CỘT TỪ THẤP ĐẾN CAO (CLICK ĐỂ MỞ POPUP) ---
-            if not df_b.empty:
-                st.markdown("#### 📊 Biểu đồ xếp hạng sản phẩm tiềm năng (Thấp → Cao)")
-                st.caption("💡 Bấm trực tiếp vào bất kỳ cột sản phẩm nào trên biểu đồ để mở **Popup chi tiết đầy đủ**.")
-
-                chart_metric = st.selectbox(
-                    "Chọn chỉ số xếp hạng trên biểu đồ:",
-                    ["Doanh thu Video", "Lượt bán", "Tăng trưởng (%)", "Hoa hồng (%)", "Tổng doanh thu"],
-                    index=0
-                )
-
-                df_chart = df_b.copy()
-                df_chart[chart_metric] = pd.to_numeric(df_chart[chart_metric], errors="coerce").fillna(0)
-                df_chart["Mã SP"] = df_chart["Mã SP"].astype(str)
-                # Tạo tên ngắn duy nhất cho trục X
-                df_chart["Tên ngắn"] = df_chart.apply(
-                    lambda r: f"{str(r['Tên sản phẩm'])[:18]}... ({str(r['Mã SP'])[-4:]})", axis=1
-                )
-
-                point_sel = alt.selection_point(name="select_prod", fields=["Mã SP"])
-                bar_chart = (
-                    alt.Chart(df_chart)
-                    .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
-                    .encode(
-                        x=alt.X(
-                            "Tên ngắn:N",
-                            sort=alt.EncodingSortField(field=chart_metric, order="ascending"),
-                            title="Sản phẩm (Xếp từ thấp → cao)",
-                            axis=alt.Axis(labelAngle=-35)
-                        ),
-                        y=alt.Y(f"{chart_metric}:Q", title=chart_metric),
-                        color=alt.condition(point_sel, alt.value("#FF4B4B"), alt.value("#4C78A8")),
-                        tooltip=[
-                            "Tên sản phẩm", "Mã SP", "Đơn giá (VNĐ)", "Hoa hồng (%)",
-                            "Lượt bán", "Số NST", "Doanh thu Video", "Tăng trưởng (%)"
-                        ]
-                    )
-                    .add_params(point_sel)
-                    .properties(height=380)
-                )
-
-                chart_event = st.altair_chart(bar_chart, use_container_width=True, on_select="rerun")
-
-                # Xử lý sự kiện Click cột -> Mở Popup
-                sel_list = chart_event.selection.get("select_prod", []) if chart_event and chart_event.selection else []
-                if sel_list:
-                    clicked_pid = str(sel_list[0].get("Mã SP", ""))
-                    if clicked_pid and clicked_pid != st.session_state.get("last_clicked_pid"):
-                        st.session_state["last_clicked_pid"] = clicked_pid
-                        matched = df_b[df_b["Mã SP"].astype(str) == clicked_pid]
-                        if not matched.empty:
-                            show_product_popup(matched.iloc[0])
-                else:
-                    st.session_state["last_clicked_pid"] = None
-
-            # --- BẢNG DỮ LIỆU & BƯỚC 3 ---
-            st.markdown("#### 📋 Bảng danh sách & Bước 3 (Check Ads + Video AI)")
-            df_b_tbl = df_b.copy()
-            df_b_tbl.insert(0, "Chọn check Ads", False)
-            df_b_display = df_b_tbl.drop(columns=["Số NST_num", "Đợt chạy"])
-
-            st.caption(f"Đang hiển thị **{len(df_b_display)}** sản phẩm. Tick vào cột **Chọn check Ads** rồi bấm nút Bước 3 bên dưới.")
-            edited_df = st.data_editor(
-                df_b_display,
-                column_config={
-                    "Chọn check Ads": st.column_config.CheckboxColumn("Chọn check Ads", default=False),
-                    **COLUMN_CONFIG
-                },
-                disabled=[c for c in df_b_display.columns if c != "Chọn check Ads"],
-                use_container_width=True,
-                height=500,
-                hide_index=True
-            )
-
-            selected_pids = edited_df[edited_df["Chọn check Ads"] == True]["Mã SP"].astype(str).tolist()
-            if st.button(f"🔥 Chạy Bước 3: Check Ads & Video AI cho {len(selected_pids)} SP đã chọn ({len(selected_pids)*0.1:.1f} điểm)", disabled=len(selected_pids) == 0):
-                prog3 = st.progress(0)
-                all_sheet_vals = dash_ws.get_all_values()
-                header_row = all_sheet_vals[0]
-                col_idx_batch = header_row.index("Đợt chạy")
-                col_idx_pid = header_row.index("Mã SP")
-                col_idx_ads_start = header_row.index("Có chạy Ads") + 1
-
-                for idx, pid in enumerate(selected_pids):
-                    v_payload = {
-                        "region": region_code,
-                        "language": lang_code,
-                        "currency": curr_code,
-                        "date_range": date_range,
-                        "sort_field": {"field": "revenue", "type": "DESC"},
-                        "page_size": 50,
-                        "page_number": 1,
-                        "product_id": pid
-                    }
-                    try:
-                        v_res = call_kalodata_api("video/rank", v_payload)
-                        vids = v_res.get("data") or []
-                    except Exception:
-                        vids = []
-
-                    ads_vids = [v for v in vids if v.get("ad") == 1]
-                    ai_vids = [v for v in vids if v.get("ai_video") == 1]
-                    max_roas = max([float(v.get("ads_roas") or 0) for v in ads_vids], default=0.0)
-
-                    has_ads = "Có" if ads_vids else "Không"
-                    has_ai = "Có" if ai_vids else "Không"
-
-                    for r_i, r_val in enumerate(all_sheet_vals[1:], start=2):
-                        if str(r_val[col_idx_batch]) == sel_batch and str(r_val[col_idx_pid]) == pid:
-                            dash_ws.update(
-                                values=[[has_ads, len(ads_vids), round(max_roas, 2), has_ai, len(ai_vids)]],
-                                range_name=gspread.utils.rowcol_to_a1(r_i, col_idx_ads_start)
-                            )
-                            break
-
-                    prog3.progress((idx + 1) / len(selected_pids))
-                    time.sleep(1.1)
-
-                st.success(f"Đã check xong Ads & Video AI cho {len(selected_pids)} sản phẩm!")
-                st.rerun()
-    except Exception as e:
-        st.error(f"Lỗi tải Dashboard: {e}")
+    st.subheader("📈 Kết quả Dashboard & Biểu đồ")
+    render_dashboard_section("tab_batch", region_code, lang_code, curr_code, date_range)
 
 # ==========================================
-# TAB 2: LẤY NHANH TOP 100 (API ĐƠN)
+# TAB 3: LẤY NHANH TOP 100 (API ĐƠN)
 # ==========================================
-with tab2:
+with tab_quick:
     if st.button(f"Gọi API lấy Top {page_size} (Trang {page_number}) & Lưu vào Sheet — 0.1 điểm", type="primary"):
-        with st.spinner("Đang gọi Kalodata API..."):
-            try:
-                res_json = call_kalodata_api("product/rank", api_payload)
-                items = res_json.get("data", [])
+        st.session_state["confirm_tab2"] = True
 
-                if not items:
-                    st.warning("Không tìm thấy sản phẩm nào khớp bộ lọc.")
-                else:
-                    crawl_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-                    rows = []
-                    for item in items:
-                        pri = item.get("pri_category") or {}
-                        sec = item.get("sec_category") or {}
-                        ter = item.get("ter_category") or {}
-                        rows.append({
-                            "Ngày lấy": crawl_time,
-                            "Ảnh SP": item.get("master_image_url", ""),
-                            "Mã SP": str(item.get("product_id", "")),
-                            "Tên sản phẩm": item.get("product_name", ""),
-                            "Đơn giá (VNĐ)": item.get("unit_price", 0),
-                            "Hoa hồng (%)": item.get("commission_rate", 0),
-                            "Lượt bán": item.get("sales_volumn", 0),
-                            "Doanh thu Video": item.get("video_revenue", 0),
-                            "Doanh thu Live": item.get("live_revenue", 0),
-                            "Doanh thu Tủ trưng bày": item.get("showcase_revenue", 0),
-                            "Tổng doanh thu": item.get("revenue", 0),
-                            "Tăng trưởng (%)": item.get("revenue_growth_rate", 0),
-                            "Ngày ra mắt": item.get("launch_date", ""),
-                            "Mã Shop": str(item.get("seller_id", "")),
-                            "Tên Shop": item.get("seller_name", ""),
-                            "Số SKU": item.get("sku_count", ""),
-                            "Mã ngành cấp 1": str(pri.get("category_id", "")),
-                            "Ngành cấp 1": pri.get("category_name", ""),
-                            "Mã ngành cấp 2": str(sec.get("category_id", "")),
-                            "Ngành cấp 2": sec.get("category_name", ""),
-                            "Mã ngành cấp 3": str(ter.get("category_id", "")),
-                            "Ngành cấp 3": ter.get("category_name", ""),
-                            "Trạng thái": "Chưa làm"
-                        })
+    if st.session_state.get("confirm_tab2"):
+        cat_summary_t2 = " > ".join(selected_cat_path) if selected_cat_path else (manual_cat_ids or "Tất cả ngành")
+        st.warning(f"⚠️ **Xác nhận gọi API lấy nhanh Top {page_size}** | Ngành: **{cat_summary_t2}** | Chi phí: **0.1 điểm** (~300đ).")
+        ct2_1, ct2_2, _ = st.columns([1.2, 1, 4])
+        if ct2_1.button("✅ Xác nhận gọi", key="exec_tab2", type="primary"):
+            st.session_state["confirm_tab2"] = False
+            with st.spinner("Đang gọi Kalodata API..."):
+                try:
+                    res_json = call_kalodata_api("product/rank", api_payload)
+                    items = res_json.get("data", [])
 
-                    df_new = pd.DataFrame(rows)
-                    st.session_state["last_df"] = df_new
+                    if not items:
+                        st.warning("Không tìm thấy sản phẩm nào khớp bộ lọc.")
+                    else:
+                        crawl_time = now_vn().strftime("%Y-%m-%d %H:%M")
+                        rows = []
+                        for item in items:
+                            pri = item.get("pri_category") or {}
+                            sec = item.get("sec_category") or {}
+                            ter = item.get("ter_category") or {}
+                            rows.append({
+                                "Ngày lấy": crawl_time,
+                                "Ảnh SP": item.get("master_image_url", ""),
+                                "Mã SP": str(item.get("product_id", "")),
+                                "Tên sản phẩm": item.get("product_name", ""),
+                                "Đơn giá (VNĐ)": to_int(item.get("unit_price", 0)),
+                                "Hoa hồng (%)": round(float(item.get("commission_rate", 0) or 0), 2),
+                                "Lượt bán": to_int(item.get("sales_volumn", 0)),
+                                "Doanh thu Video": to_int(item.get("video_revenue", 0)),
+                                "Doanh thu Live": to_int(item.get("live_revenue", 0)),
+                                "Doanh thu Tủ trưng bày": to_int(item.get("showcase_revenue", 0)),
+                                "Tổng doanh thu": to_int(item.get("revenue", 0)),
+                                "Tăng trưởng (%)": round(float(item.get("revenue_growth_rate", 0) or 0), 2),
+                                "Ngày ra mắt": item.get("launch_date", ""),
+                                "Mã Shop": str(item.get("seller_id", "")),
+                                "Tên Shop": item.get("seller_name", ""),
+                                "Số SKU": item.get("sku_count", ""),
+                                "Mã ngành cấp 1": str(pri.get("category_id", "")),
+                                "Ngành cấp 1": pri.get("category_name", ""),
+                                "Mã ngành cấp 2": str(sec.get("category_id", "")),
+                                "Ngành cấp 2": sec.get("category_name", ""),
+                                "Mã ngành cấp 3": str(ter.get("category_id", "")),
+                                "Ngành cấp 3": ter.get("category_name", ""),
+                                "Trạng thái": "Chưa làm"
+                            })
 
-                    data_ws = get_data_sheet()
-                    if not data_ws.get_all_values():
-                        data_ws.append_row(df_new.columns.tolist())
-                    data_ws.append_rows(df_new.fillna("").values.tolist())
+                        df_new = pd.DataFrame(rows)
+                        st.session_state["last_df"] = df_new
 
-                    added_count = save_master_entries(extract_master_entries_from_api(items))
-                    if added_count > 0:
-                        load_master_data.clear()
-                        st.toast(f"Đã tự động học thêm {added_count} mục mới vào Master Data!", icon="🧠")
+                        data_ws = get_data_sheet()
+                        if not data_ws.get_all_values():
+                            data_ws.append_row(df_new.columns.tolist())
+                        data_ws.append_rows(df_new.fillna("").values.tolist(), value_input_option="RAW")
 
-                    st.success(f"Đã lấy và lưu thành công {len(df_new)} sản phẩm lúc {crawl_time}!")
-            except Exception as e:
-                st.error(f"Lỗi khi gọi API hoặc lưu Sheet: {e}")
+                        added_count = save_master_entries(extract_master_entries_from_api(items))
+                        if added_count > 0:
+                            load_master_data.clear()
+                            st.toast(f"Đã tự động học thêm {added_count} mục mới vào Master Data!", icon="🧠")
+
+                        st.success(f"Đã lấy và lưu thành công {len(df_new)} sản phẩm lúc {crawl_time}!")
+                except Exception as e:
+                    st.error(f"Lỗi khi gọi API hoặc lưu Sheet: {e}")
+        if ct2_2.button("❌ Hủy", key="cancel_tab2"):
+            st.session_state["confirm_tab2"] = False
+            st.rerun()
 
     if "last_df" in st.session_state:
-        df_filtered_new = filter_dataframe(st.session_state["last_df"], key_prefix="tab2")
+        df_filtered_new = filter_dataframe(st.session_state["last_df"], key_prefix="tab_quick")
         st.caption(f"Đang hiển thị {len(df_filtered_new)} / {len(st.session_state['last_df'])} sản phẩm")
         st.dataframe(df_filtered_new, column_config=COLUMN_CONFIG, use_container_width=True, height=550)
 
 # ==========================================
-# TAB 3: KHO LƯU TRỮ GOOGLE SHEETS (DATA)
+# TAB 4: KHO LƯU TRỮ GOOGLE SHEETS (DATA)
 # ==========================================
-with tab3:
+with tab_data:
     if st.button("Tải lại dữ liệu từ Google Sheets"):
         load_master_data.clear()
         st.rerun()
@@ -775,7 +870,7 @@ with tab3:
             selected_date = st.selectbox("Lọc nhanh theo đợt lấy dữ liệu", dates)
 
             df_view = df_all if selected_date == "Tất cả" else df_all[df_all["Ngày lấy"].astype(str) == selected_date]
-            df_filtered_all = filter_dataframe(df_view, key_prefix="tab3")
+            df_filtered_all = filter_dataframe(df_view, key_prefix="tab_data")
 
             st.caption(f"Đang hiển thị {len(df_filtered_all)} / {len(df_view)} sản phẩm")
             st.dataframe(df_filtered_all, column_config=COLUMN_CONFIG, use_container_width=True, height=600)
@@ -785,9 +880,9 @@ with tab3:
         st.error(f"Lỗi đọc Google Sheets: {e}")
 
 # ==========================================
-# TAB 4: QUẢN LÝ MASTER DATA
+# TAB 5: QUẢN LÝ MASTER DATA
 # ==========================================
-with tab4:
+with tab_master:
     st.subheader("Kho Master Data tự động tích lũy")
     if st.button("Làm mới Master Data"):
         load_master_data.clear()
